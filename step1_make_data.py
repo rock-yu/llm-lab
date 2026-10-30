@@ -16,10 +16,13 @@ minutes, but it has the properties that make eval engineering interesting:
 Outputs (in ./data):
   train.jsonl            what the model learns from
   val.jsonl              what WE look at during training (checkpoint selection)
-  test.jsonl             touched once, at the end — in-distribution
-  test_ood_format.jsonl  a date format the model never saw
-  test_ood_year.jsonl    years (2040–2099) the model never saw
-  fewshot.jsonl          a handful of train examples for Part 2's prompting baseline
+  dev.jsonl              in-distribution benchmark for iteration
+  dev_ood_format.jsonl   development benchmark for unseen formats
+  dev_ood_year.jsonl     development benchmark for unseen years
+  test.jsonl             final evaluation after freezing a decision
+  test_ood_format.jsonl  a date format excluded from this lab's training data
+  test_ood_year.jsonl    years (2040–2099) excluded from this lab's training data
+  fewshot.jsonl          examples from the training date population for prompting
   data_card.json         counts, distributions and leakage checks
 
 Key ideas this step teaches:
@@ -58,9 +61,9 @@ TRAIN_FORMATS = {
     "weekday":   lambda d: f"{WEEKDAYS[d.weekday()]}, {d.day} {MONTHS[d.month-1]} {d.year}",
 }
 
-# A format held back entirely. Every *piece* of it appears in training
+# A format held back from training inputs. Every *piece* appears in training
 # (abbreviated month, zero-padded day, 4-digit year) — only the combination
-# and the '-' separators are new. Does the model compose, or memorise?
+# as a dash-separated input is new; '-' already appears in output labels.
 HELDOUT_FORMATS = {
     "bank_style": lambda d: f"{d.day:02d}-{MONTHS[d.month-1][:3]}-{d.year}",   # 03-Mar-2024
 }
@@ -99,6 +102,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n_train", type=int, default=20000)
     ap.add_argument("--n_val", type=int, default=500)
+    ap.add_argument("--n_dev", type=int, default=1000)
     ap.add_argument("--n_test", type=int, default=1000)
     ap.add_argument("--n_ood", type=int, default=500)
     ap.add_argument("--extra_formats", action="store_true",
@@ -106,6 +110,19 @@ def main():
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--out", default="data")
     args = ap.parse_args()
+
+    if min(args.n_train, args.n_val, args.n_dev, args.n_test, args.n_ood) <= 0:
+        ap.error("all dataset sizes must be positive")
+    if args.n_ood > min(args.n_dev, args.n_test):
+        ap.error("--n_ood must not exceed --n_dev or --n_test")
+    population = (dt.date(2039, 12, 31) - dt.date(1950, 1, 1)).days + 1
+    available = population - args.n_test - args.n_dev - args.n_val
+    n_formats = len(TRAIN_FORMATS) + (len(EXTRA_FORMATS) if args.extra_formats else 0)
+    if available < len(TRAIN_FORMATS) or args.n_train > available * n_formats:
+        ap.error("requested splits leave too few training dates or unique training examples")
+    future_population = (dt.date(2099, 12, 31) - dt.date(2040, 1, 1)).days + 1
+    if 2 * args.n_ood > future_population:
+        ap.error("requested OOD-year sets exceed the available disjoint future dates")
 
     rng = random.Random(args.seed)
     out = Path(args.out)
@@ -115,13 +132,15 @@ def main():
     in_dist_dates = list(date_range(dt.date(1950, 1, 1), dt.date(2039, 12, 31)))
     rng.shuffle(in_dist_dates)
 
-    # --- 2. GROUP split: carve out test/val DATES first -----------------------
+    # --- 2. GROUP split: reserve final/dev/val DATES first --------------------
     # If "3 March 2024" were in train and "03/03/2024" in test, the model would
     # already have seen the exact answer string "2024-03-03". Splitting by date
     # (the entity) rather than by row prevents that subtle leak.
     test_dates = in_dist_dates[:args.n_test]
-    val_dates = in_dist_dates[args.n_test:args.n_test + args.n_val]
-    train_dates = in_dist_dates[args.n_test + args.n_val:]
+    dev_end = args.n_test + args.n_dev
+    dev_dates = in_dist_dates[args.n_test:dev_end]
+    val_dates = in_dist_dates[dev_end:dev_end + args.n_val]
+    train_dates = in_dist_dates[dev_end + args.n_val:]
 
     fmts = list(TRAIN_FORMATS)
     train_fmts = fmts + (list(EXTRA_FORMATS) if args.extra_formats else [])
@@ -135,22 +154,27 @@ def main():
         seen.add(ex["input"])
         train.append(ex)
 
-    # --- 4. Val / test: formats assigned round-robin so every format is
-    #        equally represented (makes per-format breakdowns meaningful) -------
+    # --- 4. Val / dev / test: round-robin formats for roughly equal counts -----
     val = [make_example(d, fmts[i % len(fmts)], "val") for i, d in enumerate(val_dates)]
+    dev = [make_example(d, fmts[i % len(fmts)], "dev") for i, d in enumerate(dev_dates)]
     test = [make_example(d, fmts[i % len(fmts)], "test") for i, d in enumerate(test_dates)]
 
     # --- 5. Out-of-distribution sets -------------------------------------------
     ood_format = [make_example(d, "bank_style", "test_ood_format")
                   for d in test_dates[:args.n_ood]]
+    dev_ood_format = [make_example(d, "bank_style", "dev_ood_format")
+                      for d in dev_dates[:args.n_ood]]
     future = list(date_range(dt.date(2040, 1, 1), dt.date(2099, 12, 31)))
     random.Random(args.seed + 1).shuffle(future)   # own RNG: identical whatever the train options
     ood_year = [make_example(d, fmts[i % len(fmts)], "test_ood_year")
                 for i, d in enumerate(future[:args.n_ood])]
+    dev_ood_year = [make_example(d, fmts[i % len(fmts)], "dev_ood_year")
+                    for i, d in enumerate(future[args.n_ood:2 * args.n_ood])]
 
     fewshot = [make_example(train_dates[i], fmts[i % len(fmts)], "fewshot") for i in range(len(fmts))]
 
-    sets = {"train": train, "val": val, "test": test,
+    sets = {"train": train, "val": val, "dev": dev,
+            "dev_ood_format": dev_ood_format, "dev_ood_year": dev_ood_year, "test": test,
             "test_ood_format": ood_format, "test_ood_year": ood_year,
             "fewshot": fewshot}
     for name, rows in sets.items():
@@ -162,12 +186,25 @@ def main():
     train_inputs = {r["input"] for r in train}
     train_answers = {r["output"] for r in train}
     checks = {}
-    for name in ["val", "test", "test_ood_format", "test_ood_year"]:
+    for name in ["val", "dev", "dev_ood_format", "dev_ood_year",
+                 "test", "test_ood_format", "test_ood_year"]:
         checks[f"{name}: inputs also in train"] = sum(r["input"] in train_inputs for r in sets[name])
         checks[f"{name}: answers also in train"] = sum(r["output"] in train_answers for r in sets[name])
     checks["val/test date overlap"] = len({r["output"] for r in val} & {r["output"] for r in test})
+    groups = {
+        "train": train_answers,
+        "val": {r["output"] for r in val},
+        "dev": {r["output"] for rows in (dev, dev_ood_format, dev_ood_year) for r in rows},
+        "final": {r["output"] for rows in (test, ood_format, ood_year) for r in rows},
+    }
+    for i, (name, dates) in enumerate(groups.items()):
+        for other in list(groups)[i + 1:]:
+            checks[f"{name}/{other} date overlap"] = len(dates & groups[other])
+    if any(checks.values()):
+        raise RuntimeError(f"dataset leakage detected: {checks}")
 
     card = {
+        "protocol_version": 2,
         "seed": args.seed,
         "sizes": {k: len(v) for k, v in sets.items()},
         "train_format_counts": dict(Counter(r["format"] for r in train)),

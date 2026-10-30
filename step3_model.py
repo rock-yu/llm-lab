@@ -1,5 +1,5 @@
 """
-STEP 3 — The model: a tiny decoder-only Transformer (same family as GPT/Llama/Claude).
+STEP 3 — The model: a tiny decoder-only Transformer in the GPT architecture family.
 
 Data flow for one sequence of T token IDs:
 
@@ -9,13 +9,13 @@ Data flow for one sequence of T token IDs:
              x = x + MLP(LayerNorm(x))         each token "thinks" on its own
       ──► LayerNorm ──► Linear to vocab        (T, V)   a score for every next token
 
-"Causal" means position t may only attend to positions ≤ t. That single mask is
-what makes it a *language model*: every position is trained to predict the next
-token, using only the past. Training on one sequence of length T gives you T
-training signals at once.
+"Causal" means position t may only attend to positions ≤ t. This permits
+autoregressive next-token training without seeing future answers. Multiple
+positions can be scored in parallel; prompt and padding targets may be ignored.
 
 Default size (4 layers, 4 heads, 128 dims) ≈ 0.8M parameters. GPT-2 small is
-124M; Llama-3-8B is 8,000M. Same architecture, different knobs.
+124M; Llama-3-8B is about 8,000M. Both use decoder-only Transformers, but details
+such as positional encoding, normalization, and MLP design also differ.
 
 Run this file directly to print the parameter count.
 """
@@ -34,6 +34,7 @@ class GPTConfig:
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.0
+    causal: bool = True
 
 
 class CausalSelfAttention(nn.Module):
@@ -44,6 +45,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)   # query, key, value in one matmul
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.dropout = cfg.dropout
+        self.causal = cfg.causal
 
     def forward(self, x):
         B, T, C = x.shape
@@ -52,7 +54,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
         # softmax(q·kᵀ/√d) · v, with a causal mask so token t can't see t+1…
         y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
+            q, k, v, is_causal=self.causal, dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(y)
 
@@ -129,8 +131,8 @@ class TinyGPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.0, top_k=None, eos_id=None):
         """Autoregressive decoding: predict one token, append it, repeat.
-        temperature=0 → greedy (always the most likely token). Use greedy for evals
-        so results are deterministic and comparable between runs."""
+        temperature=0 → greedy (always the most likely token). This removes
+        sampling randomness, but hardware/software differences can still matter."""
         done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -self.cfg.block_size:])

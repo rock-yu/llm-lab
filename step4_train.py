@@ -1,7 +1,7 @@
 """
 STEP 4 — Train the tiny GPT from scratch.
 
-The whole of LLM training is this loop:
+The next-token training loop used here is:
 
     1. take a batch of token sequences
     2. forward pass  → the model's predicted distribution for each next token
@@ -10,11 +10,12 @@ The whole of LLM training is this loop:
     5. optimiser     → nudge every parameter a little downhill
     6. every so often, measure on data it ISN'T trained on (validation)
 
-Pretraining runs exactly this loop on trillions of tokens of raw text.
-Supervised fine-tuning (SFT) runs it on prompt→answer pairs — and usually only
-scores the ANSWER tokens (on by default here). Turn that off with
-`--no_mask_prompt` and the model is also graded on predicting the prompt itself.
-The textbook says masking is better; run Experiment 1 and see if it is.
+Broad-corpus pretraining uses the same basic next-token objective at much
+larger scale. Here we train on prompt→answer pairs from random weights.
+Supervised fine-tuning (SFT) commonly uses such pairs with a pretrained model.
+Only ANSWER tokens are scored by default. With `--no_mask_prompt`, the model
+is also graded on prompt predictions. Challenge 6 compares both objectives;
+neither is guaranteed to generalize better.
 
 Usage:
     python step4_train.py                         # default run → runs/baseline
@@ -22,7 +23,8 @@ Usage:
     python step4_train.py --name small_data --train_size 1000
     python step4_train.py --name no_mask --no_mask_prompt
 
-Outputs (in runs/<name>/): config.json, log.csv, ckpt_best.pt, ckpt_last.pt
+Outputs (in runs/<name>/): config.json, log.csv, ckpt_best.pt, ckpt_last.pt,
+training_manifest.json
 """
 import argparse
 import csv
@@ -37,6 +39,7 @@ import torch
 from evals import load_jsonl
 from step2_tokenizer import CharTokenizer
 from step3_model import GPTConfig, TinyGPT, predict
+from provenance import make_manifest, write_manifest
 
 
 def build_tensors(rows, tok, block_size, mask_prompt):
@@ -102,9 +105,15 @@ def main():
     ap.add_argument("--eval_interval", type=int, default=250)
     ap.add_argument("--no_mask_prompt", action="store_true")
     ap.add_argument("--overfit_one_batch", action="store_true")
+    ap.add_argument("--diagnostic_no_causal_mask", action="store_true",
+                    help="INTENTIONALLY BROKEN: allow future-token leakage for the debugging exercise")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     args = ap.parse_args()
+    started = time.perf_counter()
+    if args.diagnostic_no_causal_mask:
+        print("WARNING: diagnostic mode removes causality. Loss can cheat by seeing future tokens; "
+              "this is not a valid autoregressive model.")
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     torch.manual_seed(args.seed)
@@ -125,7 +134,8 @@ def main():
     Xtr, Ytr, Xva, Yva = Xtr.to(device), Ytr.to(device), Xva.to(device), Yva.to(device)
 
     cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=args.block_size, n_layer=args.n_layer,
-                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout)
+                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout,
+                    causal=not args.diagnostic_no_causal_mask)
     model = TinyGPT(cfg).to(device)
 
     # AdamW with weight decay on matrices only (not on biases / LayerNorm gains).
@@ -139,7 +149,7 @@ def main():
     print(f"run '{args.name}' on {device}: {model.num_params():,} params, "
           f"{len(train_rows):,} train rows, mask_prompt={mask_prompt}")
 
-    # SANITY CHECK 1: an untrained model should be maximally unsure.
+    # SANITY CHECK 1: near-uniform random predictions have loss near ln(vocab).
     init_loss = mean_loss(model, Xva, Yva)
     print(f"step 0 val loss {init_loss:.3f}  (expect ≈ ln({tok.vocab_size}) = {math.log(tok.vocab_size):.3f})")
 
@@ -187,6 +197,11 @@ def main():
         running = loss.item() if running is None else 0.9 * running + 0.1 * loss.item()
 
     log_f.close()
+    write_manifest(run_dir / "training_manifest.json", make_manifest(
+        args, [Path(args.data) / f"{s}.jsonl" for s in ("train", "val")],
+        device, started, model=cfg.__dict__, objective="next-token cross-entropy",
+        tokenizer={"kind": "character", "vocabulary": tok.itos},
+        train_rows=len(train_rows), checkpoint_selection="minimum validation answer-token loss"))
     print(f"\ndone in {time.time()-t0:.0f}s. best val loss {best_val:.4f}. "
           f"Next: python step5_eval.py --run {run_dir}")
 

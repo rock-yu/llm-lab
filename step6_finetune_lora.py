@@ -7,6 +7,7 @@ PRETRAINED, instruction-tuned model (SmolLM2-135M-Instruct, Apache-2.0) and:
   --mode zeroshot   just ask it (instruction only)              ← prompting baseline
   --mode fewshot    ask it with 7 worked examples in the prompt ← better prompting baseline
   --mode train      LoRA fine-tune on our train set, then evaluate
+  --mode lora       evaluate a saved adapter (no retraining)
 
 …all scored by the SAME harness (evals.py) on the SAME held-out sets as Part 1.
 The question you're answering is the one teams face in real life:
@@ -15,9 +16,9 @@ The question you're answering is the one teams face in real life:
 What's different from Part 1 (and why):
   * Sub-word tokenizer + chat template — the model was trained on a specific
     conversation format (<|im_start|>user …). Use the template, or it underperforms.
-  * LoRA — instead of updating all 135M weights, freeze them and learn small
-    low-rank "adapter" matrices (≈0.3% of params) on the attention projections.
-    Cheaper, faster, and the original model is untouched.
+  * LoRA — freeze the base weights and learn small low-rank "adapter" matrices
+    on attention projections. The script prints the actual trainable fraction.
+    This reduces trainable parameters and optimizer memory, not all inference cost.
   * Loss masking — same idea as Part 1: only the answer tokens are scored.
 
 Usage:
@@ -38,7 +39,9 @@ from pathlib import Path
 
 import torch
 
-from evals import load_jsonl, print_report, run_suite, save_results
+from evals import (add_eval_arguments, evaluation_plan, evaluation_tag,
+                   load_jsonl, print_report, run_suite, save_results)
+from provenance import file_identity, make_manifest, write_manifest
 
 SYSTEM = ("Convert the date to ISO 8601 format (YYYY-MM-DD). "
           "Dates written with slashes are day/month/year. Reply with the date only.")
@@ -98,6 +101,8 @@ def collate(batch, pad_id):
 
 
 def train_lora(model, tok, args, device):
+    started = time.perf_counter()
+    base_identity = model_identity(model, tok)
     from peft import LoraConfig, get_peft_model
 
     lora_cfg = LoraConfig(r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.05,
@@ -148,14 +153,35 @@ def train_lora(model, tok, args, device):
     print(f"val loss after training: {val_loss():.4f}")
     adapter_dir = Path(args.out) / "lora_adapter"
     model.save_pretrained(adapter_dir)
+    write_manifest(Path(args.out) / "training_manifest_lora.json", make_manifest(
+        args, [Path(args.data) / f"{s}.jsonl" for s in ("train", "val")],
+        device, started, base_model=base_identity, system_prompt=SYSTEM,
+        train_rows=len(rows), adapter=adapter_identity(adapter_dir),
+        checkpoint_selection="last step; validation loss reported before and after"))
     print(f"saved adapter to {adapter_dir} (only the small LoRA weights, not the base model)")
     return model
 
 
+def model_identity(model, tok):
+    return {"name": model.config._name_or_path,
+            "revision": getattr(model.config, "_commit_hash", None),
+            "tokenizer": tok.name_or_path,
+            "tokenizer_revision": tok.init_kwargs.get("_commit_hash"),
+            "chat_template": tok.chat_template}
+
+
+def adapter_identity(directory):
+    directory = Path(directory)
+    files = [directory / "adapter_config.json", directory / "adapter_model.safetensors"]
+    return [file_identity(p) for p in files]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=["zeroshot", "fewshot", "train"])
+    ap.add_argument("--mode", required=True, choices=["zeroshot", "fewshot", "train", "lora"])
     ap.add_argument("--model_id", default="HuggingFaceTB/SmolLM2-135M-Instruct")
+    ap.add_argument("--revision", default="main", help="use a commit hash to pin the base model")
+    ap.add_argument("--adapter", help="saved adapter directory, required with --mode lora")
     ap.add_argument("--data", default="data")
     ap.add_argument("--out", default="runs/smollm")
     ap.add_argument("--train_size", type=int, default=2000)
@@ -164,11 +190,24 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--lora_r", type=int, default=8)
     ap.add_argument("--target_modules", default="q_proj,k_proj,v_proj,o_proj")
-    ap.add_argument("--limit", type=int, default=300, help="examples per eval set (generation is the slow part)")
+    add_eval_arguments(ap)
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
+    started = time.perf_counter()
+    try:
+        sets, decision = evaluation_plan(args)
+        if args.final and args.mode == "train":
+            raise ValueError("freeze training first; use --mode lora --adapter PATH for final evaluation")
+        if args.mode == "lora":
+            if not args.adapter:
+                raise ValueError("--mode lora requires --adapter PATH")
+            adapter_identity(args.adapter)
+        elif args.adapter:
+            raise ValueError("--adapter is only valid with --mode lora")
+    except (ValueError, OSError) as exc:
+        ap.error(str(exc))
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -176,10 +215,12 @@ def main():
     random.seed(args.seed)
     device = pick_device(args.device)
     dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
-    tok = AutoTokenizer.from_pretrained(args.model_id)
+    tok = AutoTokenizer.from_pretrained(args.model_id, revision=args.revision)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id, revision=args.revision, dtype=dtype).to(device)
+    base_identity = model_identity(model, tok)
     print(f"{args.model_id} on {device}: {sum(p.numel() for p in model.parameters())/1e6:.0f}M params")
 
     shots = load_jsonl(Path(args.data) / "fewshot.jsonl") if args.mode == "fewshot" else []
@@ -188,12 +229,24 @@ def main():
 
     if args.mode == "train":
         model = train_lora(model, tok, args, device)
-    tag = {"zeroshot": "zeroshot", "fewshot": "fewshot", "train": "lora"}[args.mode]
+    elif args.mode == "lora":
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, args.adapter).to(device)
+    tag = "lora" if args.mode in ("train", "lora") else args.mode
 
     results = run_suite(make_predict_fn(model, tok, device, shots, args.batch_size),
-                        args.data, limit=args.limit)
+                        args.data, sets, limit=args.limit)
     print_report(f"{args.model_id} — {tag}", results)
-    print(f"\nsaved {save_results(results, args.out, tag)}")
+    files = [Path(args.data) / f"{s}.jsonl" for s in sets]
+    if shots:
+        files.append(Path(args.data) / "fewshot.jsonl")
+    adapter_dir = Path(args.out) / "lora_adapter" if args.mode == "train" else args.adapter
+    manifest = make_manifest(
+        args, files, device, started, base_model=base_identity, system_prompt=SYSTEM,
+        decoding="greedy", max_new_tokens=12, decision=decision,
+        adapter=adapter_identity(adapter_dir) if adapter_dir else None,
+        fewshot_examples=shots)
+    print(f"\nsaved {save_results(results, args.out, evaluation_tag(tag, args), manifest)}")
 
 
 if __name__ == "__main__":

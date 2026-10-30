@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated lab data, experiments, and learner submissions
+/data/
+/data_*/
+/runs/
+/submissions/
+/.lab-smoke/
+.DS_Store
+.env.*
+!.env.example

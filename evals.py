@@ -19,10 +19,48 @@ import datetime as dt
 import json
 import math
 import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+DEV_SETS = ("dev", "dev_ood_format", "dev_ood_year")
+FINAL_SETS = ("test", "test_ood_format", "test_ood_year")
+
+
+def add_eval_arguments(parser, default_limit=None):
+    parser.add_argument("--final", action="store_true", help="open the final evaluation suite")
+    parser.add_argument("--decision", help="nonempty frozen decision document, required with --final")
+    parser.add_argument("--limit", type=int, default=default_limit, help="items per development set")
+
+
+def evaluation_plan(args):
+    """Validate before loading a model or exposing final results."""
+    from provenance import decision_snapshot
+
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be positive")
+    if args.decision and not args.final:
+        raise ValueError("--decision requires --final")
+    decision = None
+    if args.final:
+        if not args.decision:
+            raise ValueError("--final requires --decision PATH; freeze your system choice first")
+        if args.limit is not None:
+            raise ValueError("final evaluation must use all items; omit --limit")
+        decision = decision_snapshot(args.decision)
+    sets = FINAL_SETS if args.final else DEV_SETS
+    for name in sets:
+        path = Path(args.data) / f"{name}.jsonl"
+        if not path.is_file():
+            raise ValueError(
+                f"missing {path}; regenerate data with step1_make_data.py "
+                "(back up old data/runs first). Test files are never used as a fallback.")
+    return sets, decision
+
+
+def evaluation_tag(tag, args):
+    return f"{tag}_final" if args.final else tag
 
 
 def load_jsonl(path):
@@ -103,15 +141,21 @@ def score(examples, preds):
     }
 
 
-def run_suite(predict_fn, data_dir="data", sets=("test", "test_ood_format", "test_ood_year"), limit=None):
+def run_suite(predict_fn, data_dir="data", sets=DEV_SETS, limit=None):
     """predict_fn: list[str] -> list[str]. Returns {set_name: score_dict}."""
     results = {}
     for name in sets:
         examples = load_jsonl(Path(data_dir) / f"{name}.jsonl")
         if limit:
             examples = examples[:limit]
+        if not examples:
+            raise ValueError(f"{name} contains no evaluation items")
+        started = time.perf_counter()
         preds = predict_fn([ex["input"] for ex in examples])
-        results[name] = score(examples, preds)
+        elapsed = time.perf_counter() - started
+        results[name] = {**score(examples, preds),
+                         "prediction_seconds": elapsed,
+                         "seconds_per_item": elapsed / len(examples)}
     return results
 
 
@@ -137,7 +181,7 @@ def print_report(title, results, show_failures=6):
             print(f"      {x['input']!r:<32} gold {x['gold']}  pred {x['pred']!r:<14} ({x['error']})")
 
 
-def save_results(results, out_dir, tag):
+def save_results(results, out_dir, tag, manifest=None):
     """Writes predictions (for error analysis and paired comparisons) + a summary."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -148,6 +192,9 @@ def save_results(results, out_dir, tag):
                 f.write(json.dumps(row) + "\n")
         summary[name] = {k: v for k, v in r.items() if k != "rows"}
     (out / f"report_{tag}.json").write_text(json.dumps(summary, indent=2))
+    if manifest is not None:
+        from provenance import write_manifest
+        write_manifest(out / f"manifest_{tag}.json", manifest)
     return out / f"report_{tag}.json"
 
 
