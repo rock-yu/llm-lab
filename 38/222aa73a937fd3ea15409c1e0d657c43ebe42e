@@ -1,0 +1,30 @@
+README.md
+  h_9afe7793eaf828 1-411
+evals.py
+  h_9afe7793eaf828 1-164
+requirements.txt
+  h_9afe7793eaf828 1-11
+step1_make_data.py
+  h_9afe7793eaf828 1-195
+step2_tokenizer.py
+  h_9afe7793eaf828 1-72
+step3_model.py
+  h_9afe7793eaf828 1-184
+step4_train.py
+  h_9afe7793eaf828 1-195
+step5_eval.py
+  h_9afe7793eaf828 1-124
+step6_finetune_lora.py
+  h_9afe7793eaf828 1-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "38222aa73a937fd3ea15409c1e0d657c43ebe42e",
+  "prompts": {},
+  "humans": {
+    "h_9afe7793eaf828": {
+      "author": "Rock Yu <rock.yu@myob.com>"
+    }
+  }
+}
