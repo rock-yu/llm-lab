@@ -1,0 +1,72 @@
+"""
+STEP 2 — The tokenizer: the only bridge between text and numbers.
+
+A model never sees text. It sees a sequence of integer IDs, and it outputs a
+probability distribution over the *vocabulary* of IDs for the next position.
+
+Real LLMs use sub-word tokenizers (BPE / SentencePiece, ~32k–200k tokens) so
+"September" might be 1–2 tokens. We use one token per CHARACTER, because:
+  * the vocabulary is tiny (~70), so the model is tiny
+  * nothing is hidden — you can read every token
+  * the trade-off is visible: sequences are longer (one step per char)
+
+Two special symbols turn "next-character prediction" into "answer a question":
+  '='  separates the prompt from the answer      3 March 2024=2024-03-03\n
+  '\n' marks end-of-answer, so generation knows when to stop (EOS)
+PAD (id 0) fills batches to equal length and is ignored by the loss.
+
+Run this file directly to see the tokenizer in action.
+"""
+import math
+import string
+
+PAD = "<pad>"
+SEP = "="
+EOS = "\n"
+UNK = "?"
+
+# A FIXED alphabet (not "whatever chars appear in train"), so out-of-distribution
+# inputs never contain characters the model has no ID for.
+CHARS = list(string.ascii_letters + string.digits + " ,./-'" + SEP + EOS + UNK)
+
+
+class CharTokenizer:
+    def __init__(self):
+        self.itos = [PAD] + CHARS                 # id -> string
+        self.stoi = {c: i for i, c in enumerate(self.itos)}  # string -> id
+        self.pad_id = 0
+        self.sep_id = self.stoi[SEP]
+        self.eos_id = self.stoi[EOS]
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.itos)
+
+    def encode(self, text: str) -> list[int]:
+        return [self.stoi.get(c, self.stoi[UNK]) for c in text]
+
+    def decode(self, ids) -> str:
+        return "".join(self.itos[i] for i in ids if i != self.pad_id)
+
+
+if __name__ == "__main__":
+    tok = CharTokenizer()
+    example = "3rd of March, 2024" + SEP + "2024-03-03" + EOS
+    ids = tok.encode(example)
+    print(f"vocab size        : {tok.vocab_size}")
+    print(f"text              : {example!r}")
+    print(f"token ids         : {ids}")
+    print(f"round trip ok     : {tok.decode(ids) == example}")
+    print(f"tokens per example: {len(ids)}")
+    # This number is your first sanity check in Step 4: an untrained model
+    # spreads probability evenly, so its loss should start near ln(vocab).
+    print(f"\nexpected loss of an untrained model ≈ ln({tok.vocab_size}) = {math.log(tok.vocab_size):.2f}")
+
+    try:  # optional: compare with a real LLM tokenizer
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        bpe = enc.encode(example)
+        print(f"\nfor comparison, a GPT-4-era BPE tokenizer uses {len(bpe)} tokens:")
+        print("  ", [enc.decode([t]) for t in bpe])
+    except ImportError:
+        print("\n(pip install tiktoken to compare with a real BPE tokenizer)")

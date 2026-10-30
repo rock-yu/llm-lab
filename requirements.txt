@@ -1,0 +1,11 @@
+# Part 1 (tiny GPT from scratch) + eval harness
+torch>=2.3
+python-dateutil>=2.8    # the "no ML" baseline in step5
+
+# Part 2 (LoRA fine-tune of a pretrained model)
+transformers>=4.45
+peft>=0.13
+accelerate>=0.34
+
+# optional: compare char tokens with a real BPE tokenizer in step2
+# tiktoken
